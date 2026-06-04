@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orion Construções | Exclusividade & Alto Padrão</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- Playfair Display para títulos luxuosos e Inter para corpo limpo -->
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600&family=Playfair+Display:ital,wght@0,400;0,600;1,400&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="background-overlay"></div>
+    
+    <div class="quiz-container">
+        <!-- Barra de Progresso Dourada -->
+        <div class="progress-container">
+            <div class="progress-bar" id="progress-bar"></div>
+        </div>
+
+        <!-- Cabeçalho Alto Padrão -->
+        <header class="quiz-header">
+            <h1 class="logo">
+                <svg width="60" height="40" viewBox="0 0 100 60" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align: middle; margin-right: 10px; filter: drop-shadow(0px 2px 4px rgba(0,0,0,0.5));">
+                    <path d="M30 10 L70 10 L85 30 L70 50 L30 50 L15 30 Z" stroke="#B3A98C" stroke-width="4" fill="rgba(179, 169, 140, 0.1)"/>
+                </svg>
+                ORION
+            </h1>
+            <span class="logo-sub">CONSTRUTORA E INCORPORADORA</span>
+        </header>
+
+        <!-- Etapa 1: Terreno + Dados -->
+        <div id="step1" class="quiz-step active">
+            <h2>Você já possui um terreno para construir?</h2>
+            <div class="options-group">
+                <button class="btn-option" onclick="selectTerrain(true)">Sim, possuo terreno</button>
+                <button class="btn-option" onclick="selectTerrain(false)">Ainda não possuo</button>
+            </div>
+            
+            <div id="lead-form" class="hidden form-animate">
+                <p class="subtitle">Excelente. Para iniciarmos sua jornada, por favor, insira seus dados:</p>
+                <input type="text" id="lead-name" placeholder="Seu nome completo" required>
+                <input type="tel" id="lead-phone" placeholder="WhatsApp (com DDD)" required>
+                <button class="btn-primary" onclick="nextStep(1, 2)">Continuar</button>
+            </div>
+        </div>
+
+        <!-- Etapa 2: Renda -->
+        <div id="step2" class="quiz-step hidden">
+            <h2>Sua renda mensal é a partir de R$ 15.000?</h2>
+            <div class="options-group">
+                <button class="btn-option" onclick="answerIncome(true)">Sim</button>
+                <button class="btn-option" onclick="answerIncome(false)">Não</button>
+            </div>
+        </div>
+
+        <!-- Etapa 3: Entrada -->
+        <div id="step3" class="quiz-step hidden">
+            <h2>Você dispõe de uma entrada mínima de R$ 50.000 para o projeto?</h2>
+            <div class="options-group">
+                <button class="btn-option" onclick="answerEntry(true)">Sim</button>
+                <button class="btn-option" onclick="answerEntry(false)">Não</button>
+            </div>
+        </div>
+
+        <!-- Sucesso (Lead Qualificado) -->
+        <div id="step-success" class="quiz-step hidden result-step">
+            <h2 class="success-text">Projeto Aprovado</h2>
+            <p>Parabéns. Você possui os pré-requisitos para iniciarmos o projeto da sua nova residência de alto padrão.</p>
+            <p class="cta-text">Fale agora com o diretor executivo para o próximo passo.</p>
+            <button class="btn-primary btn-pulse" onclick="redirectToWhatsApp()">Falar com o Diretor</button>
+        </div>
+
+        <!-- Rejeição (Lead Não Qualificado) -->
+        <div id="step-disqualified" class="quiz-step hidden result-step">
+            <h2 class="reject-text">Agradecemos o interesse</h2>
+            <p>No momento, o portfólio da Orion Construções é otimizado para um perfil de investimento específico.</p>
+            <p>Um de nossos consultores manterá seus dados para oportunidades futuras.</p>
+            <button class="btn-secondary" onclick="location.reload()">Voltar ao início</button>
+        </div>
+    </div>
+    
+    <script src="script.js"></script>
+</body>
+</html>
