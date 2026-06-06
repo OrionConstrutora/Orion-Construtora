@@ -382,98 +382,150 @@ async def status():
 
 
 # ---------------------------------------------------------------------------
-# Endpoint /lead — recebe respostas do quiz e cria lead no Kommo
+# Pipelines e etapas do Kommo — LDM Incorporadora
 # ---------------------------------------------------------------------------
-@app.post("/lead")
-async def capturar_lead(request: Request):
+PIPELINE_ID         = 13873179   # Funil de vendas
+STAGE_ACOMPANHAR    = 107051143  # Etapa de leads de entrada → ficou no meio
+STAGE_QUALIFICADO   = 107051147  # Contato inicial → lead qualificado
+STAGE_PERDIDO       = 143        # Fechado - perdido → desqualificado
+
+
+def _tel_limpo(telefone: str) -> str:
+    t = "".join(c for c in telefone if c.isdigit())
+    return t if t.startswith("55") else "55" + t
+
+
+async def _criar_contato(http: httpx.AsyncClient, nome: str, telefone: str) -> int | None:
+    headers = {"Authorization": f"Bearer {KOMMO_TOKEN}", "Content-Type": "application/json"}
+    payload = [{"name": nome, "custom_fields_values": [
+        {"field_code": "PHONE", "values": [{"value": _tel_limpo(telefone), "enum_code": "MOB"}]}
+    ]}]
+    r = await http.post(f"{KOMMO_API}/contacts", json=payload, headers=headers)
+    if r.status_code in (200, 201):
+        cid = r.json().get("_embedded", {}).get("contacts", [{}])[0].get("id")
+        log.info(f"✅ Contato criado: {cid} ({nome})")
+        return cid
+    log.warning(f"⚠️ Contato erro {r.status_code}: {r.text[:100]}")
+    return None
+
+
+async def _criar_lead(http: httpx.AsyncClient, nome: str, contact_id: int | None,
+                      stage_id: int, tag: str) -> int | None:
+    headers = {"Authorization": f"Bearer {KOMMO_TOKEN}", "Content-Type": "application/json"}
+    payload = [{
+        "name": f"{tag} — {nome}",
+        "pipeline_id": PIPELINE_ID,
+        "status_id": stage_id,
+        "_embedded": {"contacts": [{"id": contact_id}]} if contact_id else {},
+    }]
+    r = await http.post(f"{KOMMO_API}/leads", json=payload, headers=headers)
+    if r.status_code in (200, 201):
+        lid = r.json().get("_embedded", {}).get("leads", [{}])[0].get("id")
+        log.info(f"✅ Lead criado: {lid} → etapa {stage_id}")
+        return lid
+    log.warning(f"⚠️ Lead erro {r.status_code}: {r.text[:100]}")
+    return None
+
+
+async def _mover_lead(http: httpx.AsyncClient, lead_id: int, stage_id: int, nome: str, tag: str):
+    headers = {"Authorization": f"Bearer {KOMMO_TOKEN}", "Content-Type": "application/json"}
+    payload = [{"id": lead_id, "name": f"{tag} — {nome}", "status_id": stage_id}]
+    r = await http.patch(f"{KOMMO_API}/leads", json=payload, headers=headers)
+    log.info(f"📊 Lead {lead_id} → etapa {stage_id} ({r.status_code})")
+
+
+async def _nota_kommo(http: httpx.AsyncClient, lead_id: int, texto: str):
+    headers = {"Authorization": f"Bearer {KOMMO_TOKEN}", "Content-Type": "application/json"}
+    await http.post(f"{KOMMO_API}/leads/{lead_id}/notes",
+                    json=[{"note_type": "common", "params": {"text": texto}}],
+                    headers=headers)
+
+
+# ---------------------------------------------------------------------------
+# POST /lead/init — cria lead em "Acompanhar" quando lead preenche nome+tel
+# ---------------------------------------------------------------------------
+@app.post("/lead/init")
+async def lead_init(request: Request):
     """
-    Recebe dados do quiz e cria contato + lead no Kommo com todas as respostas.
-    Payload esperado:
-    {
-        "nome": "João Silva",
-        "telefone": "(92) 99999-9999",
-        "tem_terreno": true/false,
-        "renda_ok": true/false,
-        "entrada_ok": true/false,
-        "resultado": "QUALIFICADO" / "DESQUALIFICADO"
-    }
+    Chamado assim que o lead preenche nome + telefone (etapa 1 do quiz).
+    Cria contato + lead em ACOMPANHAR e retorna o lead_id para atualização futura.
     """
     try:
         dados = await request.json()
     except Exception:
         return JSONResponse({"erro": "JSON inválido"}, status_code=400)
 
-    nome      = dados.get("nome", "Lead Quiz").strip()
-    telefone  = dados.get("telefone", "").strip()
-    terreno   = dados.get("tem_terreno")
-    renda     = dados.get("renda_ok")
-    entrada   = dados.get("entrada_ok")
-    resultado = dados.get("resultado", "DESCONHECIDO")
+    nome     = dados.get("nome", "Lead Quiz").strip()
+    telefone = dados.get("telefone", "").strip()
+    terreno  = dados.get("tem_terreno")
 
-    # Normaliza telefone para formato internacional
-    tel_limpo = "".join(c for c in telefone if c.isdigit())
-    if not tel_limpo.startswith("55"):
-        tel_limpo = "55" + tel_limpo
-
-    headers = {
-        "Authorization": f"Bearer {KOMMO_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-    emoji = "✅" if resultado == "QUALIFICADO" else "❌"
-    tag_resultado = f"{emoji} {resultado}"
-
-    # Nota com todas as respostas do quiz
     nota = (
-        f"📋 *Respostas do Quiz — construtoraorion.com*\n\n"
+        f"📋 *Quiz — construtoraorion.com*\n\n"
         f"👤 Nome: {nome}\n"
-        f"📱 Telefone: {telefone}\n\n"
-        f"🏗️ Possui terreno: {'✅ Sim' if terreno else '❌ Não'}\n"
-        f"💰 Renda ≥ R$15k/mês: {'✅ Sim' if renda else '❌ Não'}\n"
-        f"💵 Tem entrada disponível: {'✅ Sim' if entrada else '❌ Não'}\n\n"
-        f"🎯 Resultado: *{tag_resultado}*\n"
+        f"📱 Telefone: {telefone}\n"
+        f"🏗️ Possui terreno: {'✅ Sim' if terreno else '❌ Não'}\n\n"
+        f"⏳ Status: *Aguardando conclusão do quiz...*\n"
         f"🌐 Origem: Quiz construtoraorion.com"
     )
 
     async with httpx.AsyncClient(timeout=15.0) as http:
-        # 1. Cria contato
-        contato_payload = [{
-            "name": nome,
-            "custom_fields_values": [
-                {"field_code": "PHONE", "values": [{"value": tel_limpo, "enum_code": "MOB"}]},
-            ],
-        }]
-        r_contato = await http.post(f"{KOMMO_API}/contacts", json=contato_payload, headers=headers)
-        contact_id = None
-        if r_contato.status_code in (200, 201):
-            contact_id = r_contato.json().get("_embedded", {}).get("contacts", [{}])[0].get("id")
-            log.info(f"✅ Contato criado: {contact_id} ({nome})")
-        else:
-            log.warning(f"⚠️ Erro ao criar contato: {r_contato.status_code} {r_contato.text[:150]}")
-
-        # 2. Cria lead
-        lead_payload = [{
-            "name": f"{tag_resultado} — {nome}",
-            "pipeline_id": None,  # usa pipeline padrão
-            "_embedded": {"contacts": [{"id": contact_id}]} if contact_id else {},
-        }]
-        r_lead = await http.post(f"{KOMMO_API}/leads", json=lead_payload, headers=headers)
-        lead_id = None
-        if r_lead.status_code in (200, 201):
-            lead_id = r_lead.json().get("_embedded", {}).get("leads", [{}])[0].get("id")
-            log.info(f"✅ Lead criado: {lead_id}")
-        else:
-            log.warning(f"⚠️ Erro ao criar lead: {r_lead.status_code} {r_lead.text[:150]}")
-
-        # 3. Adiciona nota com respostas do quiz
+        contact_id = await _criar_contato(http, nome, telefone)
+        lead_id    = await _criar_lead(http, nome, contact_id, STAGE_ACOMPANHAR, "⏳ ACOMPANHAR")
         if lead_id:
-            nota_payload = [{"note_type": "common", "params": {"text": nota}}]
-            await http.post(f"{KOMMO_API}/leads/{lead_id}/notes", json=nota_payload, headers=headers)
-            log.info(f"📝 Nota adicionada ao lead {lead_id}")
+            await _nota_kommo(http, lead_id, nota)
 
-    return JSONResponse({
-        "status": "ok",
-        "resultado": resultado,
-        "lead_id": lead_id,
-        "contact_id": contact_id,
-    })
+    return JSONResponse({"status": "ok", "lead_id": lead_id, "contact_id": contact_id})
+
+
+# ---------------------------------------------------------------------------
+# POST /lead/complete — atualiza lead com resultado final do quiz
+# ---------------------------------------------------------------------------
+@app.post("/lead/complete")
+async def lead_complete(request: Request):
+    """
+    Chamado quando o lead termina o quiz.
+    Atualiza a etapa do lead conforme o resultado:
+      QUALIFICADO   → Contato inicial
+      DESQUALIFICADO → Fechado - perdido
+    """
+    try:
+        dados = await request.json()
+    except Exception:
+        return JSONResponse({"erro": "JSON inválido"}, status_code=400)
+
+    lead_id   = dados.get("lead_id")
+    nome      = dados.get("nome", "Lead").strip()
+    resultado = dados.get("resultado", "DESQUALIFICADO")
+    terreno   = dados.get("tem_terreno")
+    renda     = dados.get("renda_ok")
+    entrada   = dados.get("entrada_ok")
+
+    if resultado == "QUALIFICADO":
+        stage_id = STAGE_QUALIFICADO
+        tag      = "✅ QUALIFICADO"
+    else:
+        stage_id = STAGE_PERDIDO
+        tag      = "❌ DESQUALIFICADO"
+
+    nota = (
+        f"📋 *Respostas do Quiz — construtoraorion.com*\n\n"
+        f"👤 Nome: {nome}\n\n"
+        f"🏗️ Possui terreno: {'✅ Sim' if terreno else '❌ Não'}\n"
+        f"💰 Renda ≥ R$15k/mês: {'✅ Sim' if renda else '❌ Não'}\n"
+        f"💵 Tem entrada disponível: {'✅ Sim' if entrada else '❌ Não'}\n\n"
+        f"🎯 Resultado final: *{tag}*\n"
+        f"🌐 Origem: Quiz construtoraorion.com"
+    )
+
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        if lead_id:
+            await _mover_lead(http, int(lead_id), stage_id, nome, tag)
+            await _nota_kommo(http, int(lead_id), nota)
+        else:
+            # Fallback: cria lead direto na etapa correta se não tem lead_id
+            contact_id = await _criar_contato(http, nome, dados.get("telefone", ""))
+            lead_id    = await _criar_lead(http, nome, contact_id, stage_id, tag)
+            if lead_id:
+                await _nota_kommo(http, lead_id, nota)
+
+    return JSONResponse({"status": "ok", "resultado": resultado, "lead_id": lead_id})
