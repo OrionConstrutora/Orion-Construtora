@@ -16,7 +16,7 @@ Variáveis de ambiente:
   KOMMO_WEBHOOK_SECRET → token secreto (opcional)
 """
 
-import os, json, time, asyncio, logging
+import os, json, time, asyncio, logging, hashlib
 import httpx
 import anthropic
 from fastapi import FastAPI, Request
@@ -49,6 +49,11 @@ WHATSAPP_TOKEN    = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")
 
 KOMMO_API = f"https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4"
+
+# ── Meta CAPI ─────────────────────────────────────────────
+META_PIXEL_ID   = os.environ.get("META_PIXEL_ID",   "1327948448428782")
+META_CAPI_TOKEN = os.environ.get("META_CAPI_TOKEN",  "")
+META_CAPI_URL   = f"https://graph.facebook.com/v20.0/{META_PIXEL_ID}/events"
 
 # IDs do agente
 with open("ldm_ids.json") as f:
@@ -100,6 +105,97 @@ def _reiniciar_sessao(talk_id: str) -> str:
     log.warning(f"Reiniciando sessão para talk {talk_id}")
     _sessoes[talk_id] = _criar_sessao(talk_id)
     return _sessoes[talk_id]
+
+
+# ---------------------------------------------------------------------------
+# Meta CAPI — funções auxiliares
+# ---------------------------------------------------------------------------
+def _sha256(value: str) -> str:
+    """SHA-256 de uma string normalizada (lowercase, sem espaços extras)."""
+    return hashlib.sha256(value.strip().lower().encode()).hexdigest()
+
+def _normalizar_tel(tel: str) -> str:
+    d = "".join(c for c in tel if c.isdigit())
+    return d if d.startswith("55") else "55" + d
+
+def _normalizar_nome(nome: str):
+    """Retorna (first_name, last_name) normalizados."""
+    import unicodedata
+    def sem_acento(s):
+        return "".join(
+            c for c in unicodedata.normalize("NFD", s)
+            if unicodedata.category(c) != "Mn"
+        ).lower().strip()
+    partes = nome.strip().split()
+    fn = sem_acento(partes[0]) if partes else ""
+    ln = sem_acento(" ".join(partes[1:])) if len(partes) > 1 else fn
+    return fn, ln
+
+async def _enviar_capi(
+    event_name: str,
+    event_id: str,
+    telefone: str,
+    nome: str,
+    external_id: str = "",
+    fbc: str = "",
+    fbp: str = "",
+    client_ip: str = "",
+    user_agent: str = "",
+    event_source_url: str = "https://construtoraorion.com/",
+    custom_data: dict | None = None,
+) -> bool:
+    """Envia evento para Meta Conversions API (server-side)."""
+    if not META_CAPI_TOKEN:
+        log.warning("META_CAPI_TOKEN não configurado — CAPI ignorado")
+        return False
+
+    tel  = _normalizar_tel(telefone) if telefone else ""
+    fn, ln = _normalizar_nome(nome) if nome else ("", "")
+    ext_id = _normalizar_tel(telefone) if not external_id else external_id
+
+    user_data: dict = {}
+    if tel:
+        user_data["ph"] = [_sha256(tel)]
+    if fn:
+        user_data["fn"] = [_sha256(fn)]
+    if ln:
+        user_data["ln"] = [_sha256(ln)]
+    if ext_id:
+        user_data["external_id"] = [_sha256(ext_id)]
+    if fbc:
+        user_data["fbc"] = fbc
+    if fbp:
+        user_data["fbp"] = fbp
+    if client_ip:
+        user_data["client_ip_address"] = client_ip
+    if user_agent:
+        user_data["client_user_agent"] = user_agent
+
+    payload = {
+        "data": [{
+            "event_name"      : event_name,
+            "event_time"      : int(time.time()),
+            "event_id"        : event_id,
+            "event_source_url": event_source_url,
+            "action_source"   : "website",
+            "user_data"       : user_data,
+        }],
+        "access_token": META_CAPI_TOKEN,
+    }
+    if custom_data:
+        payload["data"][0]["custom_data"] = custom_data
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.post(META_CAPI_URL, json=payload)
+            if r.status_code == 200:
+                log.info(f"📡 CAPI [{event_name}] enviado ✅ event_id={event_id[:8]}...")
+                return True
+            else:
+                log.warning(f"⚠️ CAPI [{event_name}] erro {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log.error(f"❌ CAPI erro: {e}")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -468,11 +564,37 @@ async def lead_init(request: Request):
         f"🌐 Origem: Quiz construtoraorion.com"
     )
 
+    # Extrai IP e user-agent do request para CAPI
+    client_ip  = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or \
+                 request.headers.get("x-real-ip", "")
+    user_agent = dados.get("user_agent", request.headers.get("user-agent", ""))
+    fbc        = dados.get("fbc", "")
+    fbp        = dados.get("fbp", "")
+    event_id   = dados.get("event_id", "")
+    event_url  = dados.get("event_source_url", "https://construtoraorion.com/")
+    external_id= dados.get("external_id", "")
+
     async with httpx.AsyncClient(timeout=15.0) as http:
         contact_id = await _criar_contato(http, nome, telefone)
         lead_id    = await _criar_lead(http, nome, contact_id, STAGE_ACOMPANHAR, "⏳ ACOMPANHAR")
         if lead_id:
             await _nota_kommo(http, lead_id, nota)
+
+    # CAPI — Lead (server-side, deduplicado com pixel via event_id)
+    if event_id:
+        asyncio.create_task(_enviar_capi(
+            event_name       = "Lead",
+            event_id         = event_id,
+            telefone         = telefone,
+            nome             = nome,
+            external_id      = external_id,
+            fbc              = fbc,
+            fbp              = fbp,
+            client_ip        = client_ip,
+            user_agent       = user_agent,
+            event_source_url = event_url,
+            custom_data      = {"content_name": "Quiz Orion — Dados Capturados", "currency": "BRL", "value": 0},
+        ))
 
     return JSONResponse({"status": "ok", "lead_id": lead_id, "contact_id": contact_id})
 
@@ -517,15 +639,80 @@ async def lead_complete(request: Request):
         f"🌐 Origem: Quiz construtoraorion.com"
     )
 
+    # Extrai metadados do request
+    client_ip  = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or \
+                 request.headers.get("x-real-ip", "")
+    user_agent = dados.get("user_agent", request.headers.get("user-agent", ""))
+    fbc        = dados.get("fbc", "")
+    fbp        = dados.get("fbp", "")
+    event_id   = dados.get("event_id", "")
+    event_url  = dados.get("event_source_url", "https://construtoraorion.com/")
+    external_id= dados.get("external_id", "")
+    telefone   = dados.get("telefone", "")
+    capi_event = dados.get("capi_event_name", "CompleteRegistration" if resultado == "QUALIFICADO" else "LeadDesqualificado")
+
     async with httpx.AsyncClient(timeout=15.0) as http:
         if lead_id:
             await _mover_lead(http, int(lead_id), stage_id, nome, tag)
             await _nota_kommo(http, int(lead_id), nota)
         else:
-            # Fallback: cria lead direto na etapa correta se não tem lead_id
-            contact_id = await _criar_contato(http, nome, dados.get("telefone", ""))
+            contact_id = await _criar_contato(http, nome, telefone)
             lead_id    = await _criar_lead(http, nome, contact_id, stage_id, tag)
             if lead_id:
                 await _nota_kommo(http, lead_id, nota)
 
+    # CAPI — CompleteRegistration ou LeadDesqualificado
+    if event_id:
+        asyncio.create_task(_enviar_capi(
+            event_name       = capi_event,
+            event_id         = event_id,
+            telefone         = telefone,
+            nome             = nome,
+            external_id      = external_id,
+            fbc              = fbc,
+            fbp              = fbp,
+            client_ip        = client_ip,
+            user_agent       = user_agent,
+            event_source_url = event_url,
+            custom_data      = {
+                "content_name": f"Quiz Orion — {resultado}",
+                "status"      : resultado == "QUALIFICADO",
+                "currency"    : "BRL",
+                "value"       : 0,
+            },
+        ))
+
     return JSONResponse({"status": "ok", "resultado": resultado, "lead_id": lead_id})
+
+
+# ---------------------------------------------------------------------------
+# POST /lead/capi — dispara evento CAPI avulso (ex: Contact no WhatsApp)
+# ---------------------------------------------------------------------------
+@app.post("/lead/capi")
+async def lead_capi(request: Request):
+    """
+    Endpoint genérico para disparar qualquer evento CAPI server-side.
+    Usado pelo quiz para eventos como Contact (clique no botão WhatsApp).
+    """
+    try:
+        dados = await request.json()
+    except Exception:
+        return JSONResponse({"erro": "JSON inválido"}, status_code=400)
+
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or \
+                request.headers.get("x-real-ip", "")
+
+    asyncio.create_task(_enviar_capi(
+        event_name       = dados.get("event_name", "Contact"),
+        event_id         = dados.get("event_id", ""),
+        telefone         = dados.get("telefone", ""),
+        nome             = dados.get("nome", ""),
+        external_id      = dados.get("external_id", ""),
+        fbc              = dados.get("fbc", ""),
+        fbp              = dados.get("fbp", ""),
+        client_ip        = client_ip,
+        user_agent       = dados.get("user_agent", request.headers.get("user-agent", "")),
+        event_source_url = dados.get("event_source_url", "https://construtoraorion.com/"),
+    ))
+
+    return JSONResponse({"status": "ok"})
