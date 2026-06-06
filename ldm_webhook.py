@@ -214,14 +214,20 @@ async def _enviar_capi(
 # ---------------------------------------------------------------------------
 async def _capi_nova_conversa_whatsapp(telefone: str, talk_id: str, ctwa_clid: str = "") -> bool:
     """
-    Envia evento messaging_conversation_started_7d via CAPI.
-    Esse evento é o mais valioso para campanhas de clique para WhatsApp:
-    conecta o clique no anúncio à conversa iniciada.
+    Envia evento CAPI para nova conversa WhatsApp.
+
+    Dois cenários:
+    1. COM ctwa_clid (veio de anúncio CTWA):
+       → LeadSubmitted + action_source=business_messaging
+       → Atribuição direta ao anúncio — evento mais valioso
+    2. SEM ctwa_clid (orgânico / link direto):
+       → Lead + action_source=website com phone
+       → Ainda enriquece o EMQ e permite remarketing
 
     Parâmetros:
-        telefone   : número E.164 do lead (ex: 5592999999999)
-        talk_id    : ID do talk no Kommo (usado como event_id único)
-        ctwa_clid  : Click-to-WhatsApp click ID (vem do payload do WhatsApp Cloud API)
+        telefone  : número E.164 do lead (ex: 5592999999999)
+        talk_id   : ID do talk no Kommo (usado como event_id)
+        ctwa_clid : Click-to-WhatsApp ID (obrigatório para evento CTWA)
     """
     if not META_CAPI_TOKEN:
         log.warning("META_CAPI_TOKEN não configurado — CAPI WhatsApp ignorado")
@@ -231,32 +237,56 @@ async def _capi_nova_conversa_whatsapp(telefone: str, talk_id: str, ctwa_clid: s
         return False
 
     tel_hash = _sha256(_normalizar_tel(telefone))
-    event_id = f"wa-conv-{talk_id}"
+    event_id = f"wa-{talk_id}"
 
-    user_data: dict = {
-        "ph"      : [tel_hash],
-        "page_id" : META_PAGE_ID,
-    }
     if ctwa_clid:
-        user_data["ctwa_clid"] = ctwa_clid
-
-    payload = {
-        "data": [{
-            "event_name"      : "messaging_conversation_started_7d",
-            "event_time"      : int(time.time()),
-            "event_id"        : event_id,
-            "action_source"   : "business_messaging",
-            "messaging_channel": "whatsapp",
-            "user_data"       : user_data,
-        }],
-        "access_token": META_CAPI_TOKEN,
-    }
+        # ── Veio de anúncio CTWA → evento business_messaging ──────────────
+        payload = {
+            "data": [{
+                "event_name"       : "LeadSubmitted",
+                "event_time"       : int(time.time()),
+                "event_id"         : event_id,
+                "action_source"    : "business_messaging",
+                "messaging_channel": "whatsapp",
+                "user_data": {
+                    "ph"       : [tel_hash],
+                    "page_id"  : META_PAGE_ID,
+                    "ctwa_clid": ctwa_clid,
+                },
+                "custom_data": {"currency": "BRL", "value": 1000},
+            }],
+            "access_token": META_CAPI_TOKEN,
+        }
+        log.info(f"📱 CAPI CTWA [LeadSubmitted+ctwa_clid] → talk={talk_id}")
+    else:
+        # ── Orgânico / link direto → evento website com phone ─────────────
+        payload = {
+            "data": [{
+                "event_name"      : "Lead",
+                "event_time"      : int(time.time()),
+                "event_id"        : event_id,
+                "event_source_url": "https://construtoraorion.com/",
+                "action_source"   : "website",
+                "user_data": {
+                    "ph"         : [tel_hash],
+                    "external_id": [tel_hash],
+                },
+                "custom_data": {
+                    "content_name": "Nova conversa WhatsApp — Orion",
+                    "currency"    : "BRL",
+                    "value"       : 1000,
+                    "content_ids" : ["orion-alto-padrao"],
+                },
+            }],
+            "access_token": META_CAPI_TOKEN,
+        }
+        log.info(f"📱 CAPI orgânico [Lead/website] → talk={talk_id}")
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as http:
             r = await http.post(META_CAPI_URL, json=payload)
             if r.status_code == 200:
-                log.info(f"📱 CAPI WhatsApp [messaging_conversation_started_7d] ✅ talk={talk_id} tel={telefone[-4:]}")
+                log.info(f"✅ CAPI WhatsApp enviado — talk={talk_id} tel=...{telefone[-4:]}")
                 return True
             else:
                 log.warning(f"⚠️ CAPI WhatsApp erro {r.status_code}: {r.text[:200]}")
