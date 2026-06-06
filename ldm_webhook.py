@@ -136,6 +136,7 @@ async def _enviar_capi(
     event_id: str,
     telefone: str,
     nome: str,
+    email: str = "",
     external_id: str = "",
     fbc: str = "",
     fbp: str = "",
@@ -149,7 +150,7 @@ async def _enviar_capi(
         log.warning("META_CAPI_TOKEN não configurado — CAPI ignorado")
         return False
 
-    tel  = _normalizar_tel(telefone) if telefone else ""
+    tel    = _normalizar_tel(telefone) if telefone else ""
     fn, ln = _normalizar_nome(nome) if nome else ("", "")
     ext_id = _normalizar_tel(telefone) if not external_id else external_id
 
@@ -160,6 +161,11 @@ async def _enviar_capi(
         user_data["fn"] = [_sha256(fn)]
     if ln:
         user_data["ln"] = [_sha256(ln)]
+    # Email — campo de maior peso no EMQ após phone
+    if email:
+        em = email.strip().lower()
+        if "@" in em:
+            user_data["em"] = [_sha256(em)]
     if ext_id:
         user_data["external_id"] = [_sha256(ext_id)]
     if fbc:
@@ -581,19 +587,26 @@ async def lead_init(request: Request):
             await _nota_kommo(http, lead_id, nota)
 
     # CAPI — Lead (server-side, deduplicado com pixel via event_id)
+    email = dados.get("email", "")
     if event_id:
         asyncio.create_task(_enviar_capi(
             event_name       = "Lead",
             event_id         = event_id,
             telefone         = telefone,
             nome             = nome,
+            email            = email,
             external_id      = external_id,
             fbc              = fbc,
             fbp              = fbp,
             client_ip        = client_ip,
             user_agent       = user_agent,
             event_source_url = event_url,
-            custom_data      = {"content_name": "Quiz Orion — Dados Capturados", "currency": "BRL", "value": 0},
+            custom_data      = {
+                "content_name": "Quiz Orion — Dados Capturados",
+                "content_ids" : dados.get("content_ids", ["orion-alto-padrao"]),
+                "currency"    : dados.get("currency", "BRL"),
+                "value"       : dados.get("value", 1000),
+            },
         ))
 
     return JSONResponse({"status": "ok", "lead_id": lead_id, "contact_id": contact_id})
@@ -662,12 +675,14 @@ async def lead_complete(request: Request):
                 await _nota_kommo(http, lead_id, nota)
 
     # CAPI — CompleteRegistration ou LeadDesqualificado
+    email = dados.get("email", "")
     if event_id:
         asyncio.create_task(_enviar_capi(
             event_name       = capi_event,
             event_id         = event_id,
             telefone         = telefone,
             nome             = nome,
+            email            = email,
             external_id      = external_id,
             fbc              = fbc,
             fbp              = fbp,
@@ -676,9 +691,10 @@ async def lead_complete(request: Request):
             event_source_url = event_url,
             custom_data      = {
                 "content_name": f"Quiz Orion — {resultado}",
+                "content_ids" : dados.get("content_ids", ["orion-alto-padrao"]),
                 "status"      : resultado == "QUALIFICADO",
-                "currency"    : "BRL",
-                "value"       : 0,
+                "currency"    : dados.get("currency", "BRL"),
+                "value"       : dados.get("value", 50000 if resultado == "QUALIFICADO" else 0),
             },
         ))
 
@@ -707,12 +723,19 @@ async def lead_capi(request: Request):
         event_id         = dados.get("event_id", ""),
         telefone         = dados.get("telefone", ""),
         nome             = dados.get("nome", ""),
+        email            = dados.get("email", ""),
         external_id      = dados.get("external_id", ""),
         fbc              = dados.get("fbc", ""),
         fbp              = dados.get("fbp", ""),
         client_ip        = client_ip,
         user_agent       = dados.get("user_agent", request.headers.get("user-agent", "")),
         event_source_url = dados.get("event_source_url", "https://construtoraorion.com/"),
+        custom_data      = {
+            "content_name": "WhatsApp Diretor — Orion Construtora",
+            "content_ids" : dados.get("content_ids", ["orion-alto-padrao"]),
+            "currency"    : dados.get("currency", "BRL"),
+            "value"       : dados.get("value", 50000),
+        },
     ))
 
     return JSONResponse({"status": "ok"})
