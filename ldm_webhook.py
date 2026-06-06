@@ -51,9 +51,13 @@ WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")
 KOMMO_API = f"https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4"
 
 # ── Meta CAPI ─────────────────────────────────────────────
-META_PIXEL_ID   = os.environ.get("META_PIXEL_ID",   "1327948448428782")
-META_CAPI_TOKEN = os.environ.get("META_CAPI_TOKEN",  "")
-META_CAPI_URL   = f"https://graph.facebook.com/v20.0/{META_PIXEL_ID}/events"
+META_PIXEL_ID    = os.environ.get("META_PIXEL_ID",    "1327948448428782")
+META_CAPI_TOKEN  = os.environ.get("META_CAPI_TOKEN",  "")
+META_CAPI_URL    = f"https://graph.facebook.com/v20.0/{META_PIXEL_ID}/events"
+# Page ID da conta Meta (Facebook Page vinculada ao WhatsApp Business)
+META_PAGE_ID     = os.environ.get("META_PAGE_ID",     "100627972913181")
+# Talks já processados nesta sessão (para detectar novas conversas)
+_talks_novos: set[str] = set()
 
 # IDs do agente
 with open("ldm_ids.json") as f:
@@ -205,6 +209,63 @@ async def _enviar_capi(
 
 
 # ---------------------------------------------------------------------------
+# CAPI — Evento de nova conversa WhatsApp (messaging_conversation_started_7d)
+# Disparado quando um lead inicia conversa pela 1ª vez — atribui ao anúncio
+# ---------------------------------------------------------------------------
+async def _capi_nova_conversa_whatsapp(telefone: str, talk_id: str, ctwa_clid: str = "") -> bool:
+    """
+    Envia evento messaging_conversation_started_7d via CAPI.
+    Esse evento é o mais valioso para campanhas de clique para WhatsApp:
+    conecta o clique no anúncio à conversa iniciada.
+
+    Parâmetros:
+        telefone   : número E.164 do lead (ex: 5592999999999)
+        talk_id    : ID do talk no Kommo (usado como event_id único)
+        ctwa_clid  : Click-to-WhatsApp click ID (vem do payload do WhatsApp Cloud API)
+    """
+    if not META_CAPI_TOKEN:
+        log.warning("META_CAPI_TOKEN não configurado — CAPI WhatsApp ignorado")
+        return False
+    if not telefone:
+        log.warning(f"[talk:{talk_id}] Sem telefone — CAPI WhatsApp não disparado")
+        return False
+
+    tel_hash = _sha256(_normalizar_tel(telefone))
+    event_id = f"wa-conv-{talk_id}"
+
+    user_data: dict = {
+        "ph"      : [tel_hash],
+        "page_id" : META_PAGE_ID,
+    }
+    if ctwa_clid:
+        user_data["ctwa_clid"] = ctwa_clid
+
+    payload = {
+        "data": [{
+            "event_name"      : "messaging_conversation_started_7d",
+            "event_time"      : int(time.time()),
+            "event_id"        : event_id,
+            "action_source"   : "business_messaging",
+            "messaging_channel": "whatsapp",
+            "user_data"       : user_data,
+        }],
+        "access_token": META_CAPI_TOKEN,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.post(META_CAPI_URL, json=payload)
+            if r.status_code == 200:
+                log.info(f"📱 CAPI WhatsApp [messaging_conversation_started_7d] ✅ talk={talk_id} tel={telefone[-4:]}")
+                return True
+            else:
+                log.warning(f"⚠️ CAPI WhatsApp erro {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log.error(f"❌ CAPI WhatsApp erro: {e}")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Comunicação com Sofia
 # ---------------------------------------------------------------------------
 def _perguntar_sofia(sessao_id: str, mensagem: str) -> str:
@@ -331,10 +392,24 @@ async def _enviar_resposta(talk_id: str, lead_id: str | None, texto: str):
 # ---------------------------------------------------------------------------
 # Processamento principal
 # ---------------------------------------------------------------------------
-async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str = ""):
+async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str = "", ctwa_clid: str = ""):
     if _e_duplicada(talk_id, msg_id, texto):
         log.debug(f"[talk:{talk_id}] Duplicada ignorada")
         return
+
+    # ── Detecta NOVA conversa → dispara CAPI WhatsApp ─────────────────────
+    is_nova_conversa = talk_id not in _talks_novos and talk_id not in _sessoes
+    if is_nova_conversa:
+        _talks_novos.add(talk_id)
+        log.info(f"[talk:{talk_id}] 🆕 Nova conversa detectada — disparando CAPI WhatsApp")
+        # Busca telefone do contato para o CAPI
+        telefone_capi = await _telefone_do_talk(talk_id)
+        if not telefone_capi:
+            # Tenta buscar via lead_id se disponível
+            telefone_capi = ""
+        asyncio.create_task(
+            _capi_nova_conversa_whatsapp(telefone_capi, talk_id, ctwa_clid)
+        )
 
     if texto == "__AUDIO__":
         await _enviar_resposta(talk_id, lead_id,
@@ -408,11 +483,18 @@ def _extrair_mensagens(dados: dict) -> list[dict]:
             else:
                 continue
 
+        # ctwa_clid — click-to-WhatsApp ID (atribuição ao anúncio Meta)
+        # Presente no campo referral.ctwa_clid do payload do WhatsApp Cloud API
+        ctwa_clid = (
+            str(msg.get("ctwa_clid", ""))
+            or str(msg.get("referral", {}).get("ctwa_clid", ""))
+        )
         mensagens.append({
             "talk_id":    str(msg.get("talk_id", "")),
             "lead_id":    str(msg.get("element_id", msg.get("lead_id", ""))),
             "text":       texto,
             "msg_id":     str(msg.get("id", "")),
+            "ctwa_clid":  ctwa_clid,
         })
 
     return mensagens
@@ -460,7 +542,13 @@ async def receber_evento(request: Request):
     for msg in mensagens:
         if msg["talk_id"]:
             asyncio.create_task(
-                _processar(msg["talk_id"], msg["lead_id"] or None, msg["text"], msg.get("msg_id", ""))
+                _processar(
+                    msg["talk_id"],
+                    msg["lead_id"] or None,
+                    msg["text"],
+                    msg.get("msg_id", ""),
+                    msg.get("ctwa_clid", ""),
+                )
             )
 
     return JSONResponse({"status": "ok", "processadas": len(mensagens)})
