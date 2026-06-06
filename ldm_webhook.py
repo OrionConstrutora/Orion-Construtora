@@ -679,6 +679,24 @@ async def lead_init(request: Request):
     telefone = dados.get("telefone", "").strip()
     terreno  = dados.get("tem_terreno")
 
+    # UTMs capturados pelo quiz
+    utm_source   = dados.get("utm_source", "")
+    utm_medium   = dados.get("utm_medium", "")
+    utm_campaign = dados.get("utm_campaign", "")
+    utm_content  = dados.get("utm_content", "")
+    utm_term     = dados.get("utm_term", "")
+
+    utms_texto = ""
+    if utm_source:
+        utms_texto = (
+            f"\n📊 *UTMs:*\n"
+            f"  Source: {utm_source}\n"
+            f"  Medium: {utm_medium}\n"
+            f"  Campaign: {utm_campaign}\n"
+        )
+        if utm_content: utms_texto += f"  Content: {utm_content}\n"
+        if utm_term:    utms_texto += f"  Term: {utm_term}\n"
+
     nota = (
         f"📋 *Quiz — construtoraorion.com*\n\n"
         f"👤 Nome: {nome}\n"
@@ -686,6 +704,7 @@ async def lead_init(request: Request):
         f"🏗️ Possui terreno: {'✅ Sim' if terreno else '❌ Não'}\n\n"
         f"⏳ Status: *Aguardando conclusão do quiz...*\n"
         f"🌐 Origem: Quiz construtoraorion.com"
+        f"{utms_texto}"
     )
 
     # Extrai IP e user-agent do request para CAPI
@@ -707,6 +726,19 @@ async def lead_init(request: Request):
     # CAPI — Lead (server-side, deduplicado com pixel via event_id)
     email = dados.get("email", "")
     if event_id:
+        # Monta custom_data com UTMs para atribuição de campanha
+        capi_custom = {
+            "content_name": "Quiz Orion — Dados Capturados",
+            "content_ids" : dados.get("content_ids", ["orion-alto-padrao"]),
+            "currency"    : dados.get("currency", "BRL"),
+            "value"       : dados.get("value", 1000),
+        }
+        if utm_source:   capi_custom["utm_source"]   = utm_source
+        if utm_medium:   capi_custom["utm_medium"]   = utm_medium
+        if utm_campaign: capi_custom["utm_campaign"] = utm_campaign
+        if utm_content:  capi_custom["utm_content"]  = utm_content
+        if utm_term:     capi_custom["utm_term"]     = utm_term
+
         asyncio.create_task(_enviar_capi(
             event_name       = "Lead",
             event_id         = event_id,
@@ -719,12 +751,7 @@ async def lead_init(request: Request):
             client_ip        = client_ip,
             user_agent       = user_agent,
             event_source_url = event_url,
-            custom_data      = {
-                "content_name": "Quiz Orion — Dados Capturados",
-                "content_ids" : dados.get("content_ids", ["orion-alto-padrao"]),
-                "currency"    : dados.get("currency", "BRL"),
-                "value"       : dados.get("value", 1000),
-            },
+            custom_data      = capi_custom,
         ))
 
     return JSONResponse({"status": "ok", "lead_id": lead_id, "contact_id": contact_id})
