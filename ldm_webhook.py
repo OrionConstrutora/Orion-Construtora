@@ -427,16 +427,20 @@ async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str 
         log.debug(f"[talk:{talk_id}] Duplicada ignorada")
         return
 
-    # ── Detecta NOVA conversa → dispara CAPI WhatsApp ─────────────────────
+    # ── Detecta NOVA conversa ─────────────────────────────────────────────
     is_nova_conversa = talk_id not in _talks_novos and talk_id not in _sessoes
     if is_nova_conversa:
         _talks_novos.add(talk_id)
-        log.info(f"[talk:{talk_id}] 🆕 Nova conversa detectada — disparando CAPI WhatsApp")
-        # Busca telefone do contato para o CAPI
+        log.info(f"[talk:{talk_id}] 🆕 Nova conversa detectada")
+
+        # Verifica se veio do quiz — se não, silencia a conversa no Kommo
+        tem_quiz = await _lead_tem_tag_quiz(lead_id or "")
+        if not tem_quiz:
+            asyncio.create_task(_silenciar_talk(talk_id))
+            log.info(f"[talk:{talk_id}] Contato não veio do quiz — notificação suprimida")
+
+        # Dispara CAPI WhatsApp
         telefone_capi = await _telefone_do_talk(talk_id)
-        if not telefone_capi:
-            # Tenta buscar via lead_id se disponível
-            telefone_capi = ""
         asyncio.create_task(
             _capi_nova_conversa_whatsapp(telefone_capi, talk_id, ctwa_clid)
         )
@@ -609,6 +613,9 @@ STAGE_ACOMPANHAR    = 107051143  # Etapa de leads de entrada → ficou no meio
 STAGE_QUALIFICADO   = 107051147  # Contato inicial → lead qualificado
 STAGE_PERDIDO       = 143        # Fechado - perdido → desqualificado
 
+# Tag que identifica leads que vieram pelo quiz (usada para filtrar notificações)
+TAG_QUIZ = "quiz-orion"
+
 
 def _tel_limpo(telefone: str) -> str:
     t = "".join(c for c in telefone if c.isdigit())
@@ -630,13 +637,18 @@ async def _criar_contato(http: httpx.AsyncClient, nome: str, telefone: str) -> i
 
 
 async def _criar_lead(http: httpx.AsyncClient, nome: str, contact_id: int | None,
-                      stage_id: int, tag: str) -> int | None:
+                      stage_id: int, tag: str, tags: list[str] | None = None) -> int | None:
     headers = {"Authorization": f"Bearer {KOMMO_TOKEN}", "Content-Type": "application/json"}
+    embedded: dict = {}
+    if contact_id:
+        embedded["contacts"] = [{"id": contact_id}]
+    if tags:
+        embedded["tags"] = [{"name": t} for t in tags]
     payload = [{
         "name": f"{tag} — {nome}",
         "pipeline_id": PIPELINE_ID,
         "status_id": stage_id,
-        "_embedded": {"contacts": [{"id": contact_id}]} if contact_id else {},
+        "_embedded": embedded,
     }]
     r = await http.post(f"{KOMMO_API}/leads", json=payload, headers=headers)
     if r.status_code in (200, 201):
@@ -645,6 +657,46 @@ async def _criar_lead(http: httpx.AsyncClient, nome: str, contact_id: int | None
         return lid
     log.warning(f"⚠️ Lead erro {r.status_code}: {r.text[:100]}")
     return None
+
+
+async def _lead_tem_tag_quiz(lead_id: str) -> bool:
+    """Retorna True se o lead tem a tag quiz-orion (veio pelo funil do quiz)."""
+    if not lead_id or lead_id in ("None", "0", ""):
+        return False
+    headers = {"Authorization": f"Bearer {KOMMO_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as http:
+            r = await http.get(
+                f"{KOMMO_API}/leads/{lead_id}",
+                params={"with": "tags"},
+                headers=headers,
+            )
+            if r.status_code != 200:
+                return False
+            tags = r.json().get("_embedded", {}).get("tags", []) or []
+            return any(t.get("name") == TAG_QUIZ for t in tags)
+    except Exception:
+        return False
+
+
+async def _silenciar_talk(talk_id: str):
+    """Marca a conversa como lida no Kommo — suprime o badge de notificação."""
+    if not talk_id:
+        return
+    headers = {"Authorization": f"Bearer {KOMMO_TOKEN}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as http:
+            r = await http.patch(
+                f"{KOMMO_API}/talks/{talk_id}",
+                json={"user_last_read_at": int(time.time())},
+                headers=headers,
+            )
+            if r.status_code in (200, 201, 204):
+                log.info(f"🔕 Talk {talk_id} silenciado — contato não veio do quiz")
+            else:
+                log.debug(f"Silenciar talk {talk_id}: {r.status_code} {r.text[:100]}")
+    except Exception as e:
+        log.debug(f"Silenciar talk {talk_id} erro: {e}")
 
 
 async def _mover_lead(http: httpx.AsyncClient, lead_id: int, stage_id: int, nome: str, tag: str):
@@ -719,7 +771,7 @@ async def lead_init(request: Request):
 
     async with httpx.AsyncClient(timeout=15.0) as http:
         contact_id = await _criar_contato(http, nome, telefone)
-        lead_id    = await _criar_lead(http, nome, contact_id, STAGE_ACOMPANHAR, "⏳ ACOMPANHAR")
+        lead_id    = await _criar_lead(http, nome, contact_id, STAGE_ACOMPANHAR, "⏳ ACOMPANHAR", tags=[TAG_QUIZ])
         if lead_id:
             await _nota_kommo(http, lead_id, nota)
 
@@ -815,7 +867,7 @@ async def lead_complete(request: Request):
             await _nota_kommo(http, int(lead_id), nota)
         else:
             contact_id = await _criar_contato(http, nome, telefone)
-            lead_id    = await _criar_lead(http, nome, contact_id, stage_id, tag)
+            lead_id    = await _criar_lead(http, nome, contact_id, stage_id, tag, tags=[TAG_QUIZ])
             if lead_id:
                 await _nota_kommo(http, lead_id, nota)
 
