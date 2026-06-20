@@ -624,6 +624,14 @@ STAGE_PERDIDO       = 143        # Fechado - perdido → desqualificado
 TAG_QUIZ    = "quiz-orion"
 TAG_ANUNCIO = "anuncio-whatsapp"
 
+# ── Pipeline exclusivo de Anúncios WhatsApp ────────────────────────────────
+PIPELINE_ANUNCIO_WA   = 13982575   # 🟢 Anuncios WhatsApp
+STAGE_WA_NOVA_CONV    = 107914367  # Nova Conversa    (entrada)
+STAGE_WA_QUALIFICANDO = 107914371  # Em Qualificacao
+STAGE_WA_QUALIFICADO  = 107914375  # Qualificado
+STAGE_WA_REUNIAO      = 107914379  # Reuniao Agendada
+STAGE_WA_NAO_QUAL     = 107914383  # Nao Qualificado
+
 
 def _tel_limpo(telefone: str) -> str:
     t = "".join(c for c in telefone if c.isdigit())
@@ -689,7 +697,9 @@ async def _lead_tem_tag_quiz(lead_id: str) -> bool:
 
 async def _identificar_lead_anuncio(lead_id: str, ctwa_clid: str):
     """
-    Marca o lead no Kommo como vindo de anúncio WhatsApp (Click-to-WhatsApp).
+    Quando um lead chega via anúncio Click-to-WhatsApp (ctwa_clid presente):
+    - Move o lead para o pipeline exclusivo 'Anuncios WhatsApp'
+    - Etapa inicial: 'Nova Conversa'
     - Renomeia com prefixo 🟢 ANÚNCIO WA
     - Adiciona tag 'anuncio-whatsapp'
     - Adiciona nota com ctwa_clid para rastreamento
@@ -699,32 +709,32 @@ async def _identificar_lead_anuncio(lead_id: str, ctwa_clid: str):
     headers = {"Authorization": f"Bearer {KOMMO_TOKEN}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=10.0) as http:
-            # Busca o lead atual para obter o nome
+            # Busca o lead atual para obter o nome e pipeline atual
             r = await http.get(f"{KOMMO_API}/leads/{lead_id}", headers=headers)
             if r.status_code != 200:
                 log.warning(f"[anuncio] Não encontrou lead {lead_id}: {r.status_code}")
                 return
-            lead     = r.json()
-            nome_raw = lead.get("name", "Lead WhatsApp")
+            lead        = r.json()
+            nome_raw    = lead.get("name", "Lead WhatsApp")
+            pipeline_id = lead.get("pipeline_id")
 
             # Renomeia com 🟢 apenas se ainda não foi marcado
-            if "🟢" not in nome_raw and "ANÚNCIO" not in nome_raw:
-                # Remove prefixos anteriores do quiz se houver
-                nome_limpo = nome_raw.replace("⏳ ACOMPANHAR — ", "").replace("✅ QUALIFICADO — ", "").strip()
-                novo_nome  = f"🟢 ANÚNCIO WA — {nome_limpo}"
-                patch_r = await http.patch(
-                    f"{KOMMO_API}/leads",
-                    json=[{
-                        "id"       : int(lead_id),
-                        "name"     : novo_nome,
-                        "_embedded": {"tags": [{"name": TAG_ANUNCIO}]},
-                    }],
-                    headers=headers,
-                )
-                if patch_r.status_code in (200, 201):
-                    log.info(f"✅ Lead {lead_id} → '{novo_nome}' + tag {TAG_ANUNCIO}")
-                else:
-                    log.warning(f"⚠️ Patch lead {lead_id}: {patch_r.status_code} {patch_r.text[:100]}")
+            nome_limpo = nome_raw.replace("⏳ ACOMPANHAR — ", "").replace("✅ QUALIFICADO — ", "").strip()
+            novo_nome  = f"🟢 ANÚNCIO WA — {nome_limpo}" if "🟢" not in nome_raw else nome_raw
+
+            # Move para pipeline exclusivo de anúncios WA + renomeia + tag
+            patch_payload = [{
+                "id"         : int(lead_id),
+                "name"       : novo_nome,
+                "pipeline_id": PIPELINE_ANUNCIO_WA,
+                "status_id"  : STAGE_WA_NOVA_CONV,
+                "_embedded"  : {"tags": [{"name": TAG_ANUNCIO}]},
+            }]
+            patch_r = await http.patch(f"{KOMMO_API}/leads", json=patch_payload, headers=headers)
+            if patch_r.status_code in (200, 201):
+                log.info(f"✅ Lead {lead_id} → pipeline Anúncios WA | '{novo_nome}'")
+            else:
+                log.warning(f"⚠️ Patch lead {lead_id}: {patch_r.status_code} {patch_r.text[:150]}")
 
             # Adiciona nota de rastreamento com ctwa_clid
             nota = (
@@ -732,7 +742,7 @@ async def _identificar_lead_anuncio(lead_id: str, ctwa_clid: str):
                 f"🎯 Origem: Campanha paga Meta — Click-to-WhatsApp\n"
                 f"🔑 ctwa_clid: {ctwa_clid}\n"
                 f"🕐 {time.strftime('%d/%m/%Y %H:%M')}\n\n"
-                f"⚡ Lead identificado automaticamente pelo sistema."
+                f"⚡ Lead movido automaticamente para pipeline Anúncios WhatsApp."
             )
             await http.post(
                 f"{KOMMO_API}/leads/{lead_id}/notes",
