@@ -60,6 +60,9 @@ META_PAGE_ID     = os.environ.get("META_PAGE_ID",     "100627972913181")
 _talks_novos: set[str] = set()
 # Talks que vieram de anúncio CTWA — Sofia não responde, João atende manualmente
 _talks_anuncio: set[str] = set()
+# Telefones que clicaram em anúncio CTWA → rastreia quem salvou o contato e voltou depois
+# Formato: { "5592999999999": {"ctwa_clid": "...", "source_id": "...", "ts": 1234567890} }
+_telefones_anuncio: dict[str, dict] = {}
 
 # IDs do agente
 with open("ldm_ids.json") as f:
@@ -424,7 +427,7 @@ async def _enviar_resposta(talk_id: str, lead_id: str | None, texto: str):
 # ---------------------------------------------------------------------------
 # Processamento principal
 # ---------------------------------------------------------------------------
-async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str = "", ctwa_clid: str = ""):
+async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str = "", ctwa_clid: str = "", source_id: str = "", ad_headline: str = ""):
     if _e_duplicada(talk_id, msg_id, texto):
         log.debug(f"[talk:{talk_id}] Duplicada ignorada")
         return
@@ -435,24 +438,51 @@ async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str 
         _talks_novos.add(talk_id)
         log.info(f"[talk:{talk_id}] 🆕 Nova conversa detectada")
 
-        is_anuncio = bool(ctwa_clid)   # veio de anúncio Click-to-WhatsApp
+        is_anuncio = bool(ctwa_clid)   # veio de anúncio Click-to-WhatsApp (clique direto)
         tem_quiz   = await _lead_tem_tag_quiz(lead_id or "")
 
+        # Busca o telefone do contato para rastreamento por anúncio
+        telefone_lead = await _telefone_do_talk(talk_id)
+        tel_norm      = _normalizar_tel(telefone_lead) if telefone_lead else ""
+
         if is_anuncio:
-            # ── Veio de anúncio pago → identifica no Kommo, João atende ──────
-            log.info(f"[talk:{talk_id}] 📱 Lead de anúncio CTWA — João atenderá manualmente")
+            # ── Clique direto no anúncio (ctwa_clid presente) ─────────────────
+            log.info(f"[talk:{talk_id}] 📱 Lead de anúncio CTWA direto | ad={source_id}")
+            _talks_anuncio.add(talk_id)
+            # Salva telefone → info do anúncio (para rastrear se voltar depois)
+            if tel_norm:
+                _telefones_anuncio[tel_norm] = {
+                    "ctwa_clid"  : ctwa_clid,
+                    "source_id"  : source_id,
+                    "ad_headline": ad_headline,
+                    "ts"         : time.time(),
+                }
+                log.info(f"📞 Telefone {tel_norm[-4:]}... salvo → anúncio {source_id or 'desconhecido'}")
+            if lead_id:
+                asyncio.create_task(_identificar_lead_anuncio(
+                    lead_id, ctwa_clid, source_id, ad_headline, retornou=False
+                ))
+
+        elif tel_norm and tel_norm in _telefones_anuncio:
+            # ── Salvou contato via anúncio e voltou dias depois ───────────────
+            info = _telefones_anuncio[tel_norm]
+            dias = round((time.time() - info["ts"]) / 86400, 1)
+            log.info(f"[talk:{talk_id}] ♻️ Lead retornou {dias}d após clicar no anúncio {info['source_id']}")
             _talks_anuncio.add(talk_id)
             if lead_id:
-                asyncio.create_task(_identificar_lead_anuncio(lead_id, ctwa_clid))
+                asyncio.create_task(_identificar_lead_anuncio(
+                    lead_id, info["ctwa_clid"], info["source_id"], info["ad_headline"],
+                    retornou=True, dias=dias
+                ))
+
         elif not tem_quiz:
             # ── Orgânico sem quiz e sem anúncio → silencia ───────────────────
             asyncio.create_task(_silenciar_talk(talk_id))
             log.info(f"[talk:{talk_id}] Contato orgânico sem quiz — notificação suprimida")
 
         # Dispara CAPI WhatsApp (quiz, anúncio ou orgânico)
-        telefone_capi = await _telefone_do_talk(talk_id)
         asyncio.create_task(
-            _capi_nova_conversa_whatsapp(telefone_capi, talk_id, ctwa_clid)
+            _capi_nova_conversa_whatsapp(telefone_lead, talk_id, ctwa_clid)
         )
 
     if texto == "__AUDIO__":
@@ -533,17 +563,21 @@ def _extrair_mensagens(dados: dict) -> list[dict]:
                 continue
 
         # ctwa_clid — click-to-WhatsApp ID (atribuição ao anúncio Meta)
-        # Presente no campo referral.ctwa_clid do payload do WhatsApp Cloud API
-        ctwa_clid = (
-            str(msg.get("ctwa_clid", ""))
-            or str(msg.get("referral", {}).get("ctwa_clid", ""))
-        )
+        referral  = msg.get("referral", {}) or {}
+        ctwa_clid = str(msg.get("ctwa_clid", "") or referral.get("ctwa_clid", ""))
+        # source_id = ID do anúncio Meta que gerou o clique (rastreamento por anúncio)
+        source_id = str(referral.get("source_id", "") or msg.get("source_id", ""))
+        # headline do anúncio (título do criativo)
+        ad_headline = str(referral.get("headline", "") or msg.get("headline", ""))
+
         mensagens.append({
-            "talk_id":    str(msg.get("talk_id", "")),
-            "lead_id":    str(msg.get("element_id", msg.get("lead_id", ""))),
-            "text":       texto,
-            "msg_id":     str(msg.get("id", "")),
-            "ctwa_clid":  ctwa_clid,
+            "talk_id"    : str(msg.get("talk_id", "")),
+            "lead_id"    : str(msg.get("element_id", msg.get("lead_id", ""))),
+            "text"       : texto,
+            "msg_id"     : str(msg.get("id", "")),
+            "ctwa_clid"  : ctwa_clid,
+            "source_id"  : source_id,    # ID do anúncio Meta
+            "ad_headline": ad_headline,  # Título do criativo
         })
 
     return mensagens
@@ -597,6 +631,8 @@ async def receber_evento(request: Request):
                     msg["text"],
                     msg.get("msg_id", ""),
                     msg.get("ctwa_clid", ""),
+                    msg.get("source_id", ""),
+                    msg.get("ad_headline", ""),
                 )
             )
 
@@ -703,61 +739,80 @@ async def _lead_tem_tag_quiz(lead_id: str) -> bool:
         return False
 
 
-async def _identificar_lead_anuncio(lead_id: str, ctwa_clid: str):
+async def _identificar_lead_anuncio(
+    lead_id: str,
+    ctwa_clid: str,
+    source_id: str = "",
+    ad_headline: str = "",
+    retornou: bool = False,
+    dias: float = 0.0,
+):
     """
-    Quando um lead chega via anúncio Click-to-WhatsApp (ctwa_clid presente):
-    - Move o lead para o pipeline exclusivo 'Anuncios WhatsApp'
-    - Etapa inicial: 'Nova Conversa'
-    - Renomeia com prefixo 🟢 ANÚNCIO WA
-    - Adiciona tag 'anuncio-whatsapp'
-    - Adiciona nota com ctwa_clid para rastreamento
+    Move o lead para o pipeline exclusivo 'Anuncios WhatsApp' e registra rastreamento.
+
+    Cenários:
+      retornou=False → clique direto no anúncio (ctwa_clid presente na 1ª mensagem)
+      retornou=True  → salvou o contato via anúncio e voltou dias depois
     """
     if not lead_id or lead_id in ("None", "0", ""):
         return
     headers = {"Authorization": f"Bearer {KOMMO_TOKEN}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=10.0) as http:
-            # Busca o lead atual para obter o nome e pipeline atual
+            # Busca o lead atual para obter o nome
             r = await http.get(f"{KOMMO_API}/leads/{lead_id}", headers=headers)
             if r.status_code != 200:
                 log.warning(f"[anuncio] Não encontrou lead {lead_id}: {r.status_code}")
                 return
-            lead        = r.json()
-            nome_raw    = lead.get("name", "Lead WhatsApp")
-            pipeline_id = lead.get("pipeline_id")
+            lead     = r.json()
+            nome_raw = lead.get("name", "Lead WhatsApp")
 
-            # Renomeia com 🟢 apenas se ainda não foi marcado
+            # Renomeia com 🟢 se ainda não foi marcado
             nome_limpo = nome_raw.replace("⏳ ACOMPANHAR — ", "").replace("✅ QUALIFICADO — ", "").strip()
             novo_nome  = f"🟢 ANÚNCIO WA — {nome_limpo}" if "🟢" not in nome_raw else nome_raw
 
-            # Move para pipeline exclusivo de anúncios WA + renomeia + tag
-            patch_payload = [{
-                "id"         : int(lead_id),
-                "name"       : novo_nome,
-                "pipeline_id": PIPELINE_ANUNCIO_WA,
-                "status_id"  : STAGE_WA_NOVA_CONV,
-                "_embedded"  : {"tags": [{"name": TAG_ANUNCIO}]},
-            }]
-            patch_r = await http.patch(f"{KOMMO_API}/leads", json=patch_payload, headers=headers)
+            # Move para pipeline exclusivo + renomeia + tag
+            patch_r = await http.patch(
+                f"{KOMMO_API}/leads",
+                json=[{
+                    "id"         : int(lead_id),
+                    "name"       : novo_nome,
+                    "pipeline_id": PIPELINE_ANUNCIO_WA,
+                    "status_id"  : STAGE_WA_NOVA_CONV,
+                    "_embedded"  : {"tags": [{"name": TAG_ANUNCIO}]},
+                }],
+                headers=headers,
+            )
             if patch_r.status_code in (200, 201):
                 log.info(f"✅ Lead {lead_id} → pipeline Anúncios WA | '{novo_nome}'")
             else:
                 log.warning(f"⚠️ Patch lead {lead_id}: {patch_r.status_code} {patch_r.text[:150]}")
 
-            # Adiciona nota de rastreamento com ctwa_clid
+            # ── Nota de rastreamento completa ─────────────────────────────────
+            if retornou:
+                origem_txt = (
+                    f"♻️ *Lead Retornou via Contato Salvo*\n\n"
+                    f"📌 Esta pessoa clicou no anúncio, salvou o contato\n"
+                    f"   e voltou a mensagem {dias:.1f} dia(s) depois.\n"
+                )
+            else:
+                origem_txt = f"📱 *Lead de Anúncio WhatsApp (clique direto)*\n\n"
+
             nota = (
-                f"📱 *Lead de Anúncio WhatsApp (CTWA)*\n\n"
+                f"{origem_txt}"
                 f"🎯 Origem: Campanha paga Meta — Click-to-WhatsApp\n"
-                f"🔑 ctwa_clid: {ctwa_clid}\n"
-                f"🕐 {time.strftime('%d/%m/%Y %H:%M')}\n\n"
-                f"⚡ Lead movido automaticamente para pipeline Anúncios WhatsApp."
+                + (f"📢 Anúncio: {ad_headline}\n" if ad_headline else "")
+                + (f"🔑 Ad ID (source_id): {source_id}\n" if source_id else "")
+                + (f"🆔 ctwa_clid: {ctwa_clid}\n" if ctwa_clid else "")
+                + f"🕐 {time.strftime('%d/%m/%Y %H:%M')}\n\n"
+                f"⚡ Identificado automaticamente pelo sistema."
             )
             await http.post(
                 f"{KOMMO_API}/leads/{lead_id}/notes",
                 json=[{"note_type": "common", "params": {"text": nota}}],
                 headers=headers,
             )
-            log.info(f"📝 Nota CTWA adicionada ao lead {lead_id}")
+            log.info(f"📝 Nota anúncio adicionada ao lead {lead_id} | retornou={retornou}")
     except Exception as e:
         log.error(f"❌ Erro ao identificar lead de anúncio {lead_id}: {e}")
 
