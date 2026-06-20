@@ -427,7 +427,7 @@ async def _enviar_resposta(talk_id: str, lead_id: str | None, texto: str):
 # ---------------------------------------------------------------------------
 # Processamento principal
 # ---------------------------------------------------------------------------
-async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str = "", ctwa_clid: str = "", source_id: str = "", ad_headline: str = ""):
+async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str = "", ctwa_clid: str = "", source_id: str = "", ad_headline: str = "", is_instagram: bool = False, source_type: str = ""):
     if _e_duplicada(talk_id, msg_id, texto):
         log.debug(f"[talk:{talk_id}] Duplicada ignorada")
         return
@@ -438,41 +438,55 @@ async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str 
         _talks_novos.add(talk_id)
         log.info(f"[talk:{talk_id}] 🆕 Nova conversa detectada")
 
-        is_anuncio = bool(ctwa_clid)   # veio de anúncio Click-to-WhatsApp (clique direto)
+        # Identifica origem da conversa
+        is_ctwa    = bool(ctwa_clid)                        # WhatsApp CTWA direto
+        is_ig_ad   = is_instagram and source_type == "ad"   # Instagram DM de anúncio
+        is_anuncio = is_ctwa or is_ig_ad
         tem_quiz   = await _lead_tem_tag_quiz(lead_id or "")
 
-        # Busca o telefone do contato para rastreamento por anúncio
+        # Busca o telefone/ID do contato para rastreamento
         telefone_lead = await _telefone_do_talk(talk_id)
         tel_norm      = _normalizar_tel(telefone_lead) if telefone_lead else ""
 
-        if is_anuncio:
-            # ── Clique direto no anúncio (ctwa_clid presente) ─────────────────
-            log.info(f"[talk:{talk_id}] 📱 Lead de anúncio CTWA direto | ad={source_id}")
+        if is_ctwa:
+            # ── WhatsApp: clique direto no anúncio CTWA ───────────────────────
+            log.info(f"[talk:{talk_id}] 📱 WhatsApp CTWA direto | ad={source_id}")
             _talks_anuncio.add(talk_id)
-            # Salva telefone → info do anúncio (para rastrear se voltar depois)
             if tel_norm:
                 _telefones_anuncio[tel_norm] = {
                     "ctwa_clid"  : ctwa_clid,
                     "source_id"  : source_id,
                     "ad_headline": ad_headline,
+                    "canal"      : "whatsapp",
                     "ts"         : time.time(),
                 }
-                log.info(f"📞 Telefone {tel_norm[-4:]}... salvo → anúncio {source_id or 'desconhecido'}")
             if lead_id:
                 asyncio.create_task(_identificar_lead_anuncio(
-                    lead_id, ctwa_clid, source_id, ad_headline, retornou=False
+                    lead_id, ctwa_clid, source_id, ad_headline,
+                    canal="whatsapp", retornou=False
+                ))
+
+        elif is_ig_ad:
+            # ── Instagram DM: clique no anúncio ───────────────────────────────
+            log.info(f"[talk:{talk_id}] 📸 Instagram DM de anúncio | ad={source_id}")
+            _talks_anuncio.add(talk_id)
+            if lead_id:
+                asyncio.create_task(_identificar_lead_anuncio(
+                    lead_id, ctwa_clid, source_id, ad_headline,
+                    canal="instagram", retornou=False
                 ))
 
         elif tel_norm and tel_norm in _telefones_anuncio:
             # ── Salvou contato via anúncio e voltou dias depois ───────────────
             info = _telefones_anuncio[tel_norm]
             dias = round((time.time() - info["ts"]) / 86400, 1)
-            log.info(f"[talk:{talk_id}] ♻️ Lead retornou {dias}d após clicar no anúncio {info['source_id']}")
+            canal = info.get("canal", "whatsapp")
+            log.info(f"[talk:{talk_id}] ♻️ Lead retornou {dias}d após anúncio ({canal})")
             _talks_anuncio.add(talk_id)
             if lead_id:
                 asyncio.create_task(_identificar_lead_anuncio(
                     lead_id, info["ctwa_clid"], info["source_id"], info["ad_headline"],
-                    retornou=True, dias=dias
+                    canal=canal, retornou=True, dias=dias
                 ))
 
         elif not tem_quiz:
@@ -563,21 +577,33 @@ def _extrair_mensagens(dados: dict) -> list[dict]:
                 continue
 
         # ctwa_clid — click-to-WhatsApp ID (atribuição ao anúncio Meta)
-        referral  = msg.get("referral", {}) or {}
-        ctwa_clid = str(msg.get("ctwa_clid", "") or referral.get("ctwa_clid", ""))
-        # source_id = ID do anúncio Meta que gerou o clique (rastreamento por anúncio)
-        source_id = str(referral.get("source_id", "") or msg.get("source_id", ""))
+        referral    = msg.get("referral", {}) or {}
+        ctwa_clid   = str(msg.get("ctwa_clid", "") or referral.get("ctwa_clid", ""))
+        # source_id = ID do anúncio Meta que gerou o clique
+        source_id   = str(referral.get("source_id", "") or msg.get("source_id", ""))
+        # source_type = "ad" quando veio de anúncio (Instagram ou WhatsApp)
+        source_type = str(referral.get("source_type", "") or msg.get("source_type", "")).lower()
         # headline do anúncio (título do criativo)
         ad_headline = str(referral.get("headline", "") or msg.get("headline", ""))
+        # Canal de origem: detecta Instagram pelo author ou channel
+        author_info = msg.get("author", {}) or {}
+        channel_raw = str(
+            msg.get("channel", "") or
+            author_info.get("type", "") or
+            msg.get("origin", "") or ""
+        ).lower()
+        is_instagram = "instagram" in channel_raw or "ig" in channel_raw
 
         mensagens.append({
-            "talk_id"    : str(msg.get("talk_id", "")),
-            "lead_id"    : str(msg.get("element_id", msg.get("lead_id", ""))),
-            "text"       : texto,
-            "msg_id"     : str(msg.get("id", "")),
-            "ctwa_clid"  : ctwa_clid,
-            "source_id"  : source_id,    # ID do anúncio Meta
-            "ad_headline": ad_headline,  # Título do criativo
+            "talk_id"     : str(msg.get("talk_id", "")),
+            "lead_id"     : str(msg.get("element_id", msg.get("lead_id", ""))),
+            "text"        : texto,
+            "msg_id"      : str(msg.get("id", "")),
+            "ctwa_clid"   : ctwa_clid,
+            "source_id"   : source_id,
+            "source_type" : source_type,   # "ad" quando veio de anúncio
+            "ad_headline" : ad_headline,
+            "is_instagram": is_instagram,  # True se veio do Instagram DM
         })
 
     return mensagens
@@ -633,6 +659,8 @@ async def receber_evento(request: Request):
                     msg.get("ctwa_clid", ""),
                     msg.get("source_id", ""),
                     msg.get("ad_headline", ""),
+                    msg.get("is_instagram", False),
+                    msg.get("source_type", ""),
                 )
             )
 
@@ -675,6 +703,14 @@ STAGE_WA_QUALIFICANDO = 107914371  # Em Qualificacao
 STAGE_WA_QUALIFICADO  = 107914375  # Qualificado
 STAGE_WA_REUNIAO      = 107914379  # Reuniao Agendada
 STAGE_WA_NAO_QUAL     = 107914383  # Nao Qualificado
+
+# ── Pipeline exclusivo de Anúncios Instagram ───────────────────────────────
+PIPELINE_ANUNCIO_IG   = 13982647   # 📸 Anuncios Instagram
+STAGE_IG_NOVA_CONV    = 107914887  # Nova Conversa    (entrada)
+STAGE_IG_QUALIFICANDO = 107914891  # Em Qualificacao
+STAGE_IG_QUALIFICADO  = 107914895  # Qualificado
+STAGE_IG_REUNIAO      = 107914899  # Reuniao Agendada
+STAGE_IG_NAO_QUAL     = 107914903  # Nao Qualificado
 
 
 def _tel_limpo(telefone: str) -> str:
@@ -744,6 +780,7 @@ async def _identificar_lead_anuncio(
     ctwa_clid: str,
     source_id: str = "",
     ad_headline: str = "",
+    canal: str = "whatsapp",   # "whatsapp" ou "instagram"
     retornou: bool = False,
     dias: float = 0.0,
 ):
@@ -767,9 +804,18 @@ async def _identificar_lead_anuncio(
             lead     = r.json()
             nome_raw = lead.get("name", "Lead WhatsApp")
 
-            # Renomeia com 🟢 se ainda não foi marcado
+            # Define pipeline e emoji conforme canal
+            is_ig = canal == "instagram"
+            emoji     = "📸" if is_ig else "🟢"
+            canal_txt = "IG" if is_ig else "WA"
+            pipeline  = PIPELINE_ANUNCIO_IG if is_ig else PIPELINE_ANUNCIO_WA
+            stage     = STAGE_IG_NOVA_CONV  if is_ig else STAGE_WA_NOVA_CONV
+            tag_canal = f"anuncio-instagram" if is_ig else TAG_ANUNCIO
+
+            # Renomeia com emoji se ainda não foi marcado
             nome_limpo = nome_raw.replace("⏳ ACOMPANHAR — ", "").replace("✅ QUALIFICADO — ", "").strip()
-            novo_nome  = f"🟢 ANÚNCIO WA — {nome_limpo}" if "🟢" not in nome_raw else nome_raw
+            ja_marcado = "🟢" in nome_raw or "📸" in nome_raw
+            novo_nome  = f"{emoji} ANÚNCIO {canal_txt} — {nome_limpo}" if not ja_marcado else nome_raw
 
             # Move para pipeline exclusivo + renomeia + tag
             patch_r = await http.patch(
@@ -777,9 +823,9 @@ async def _identificar_lead_anuncio(
                 json=[{
                     "id"         : int(lead_id),
                     "name"       : novo_nome,
-                    "pipeline_id": PIPELINE_ANUNCIO_WA,
-                    "status_id"  : STAGE_WA_NOVA_CONV,
-                    "_embedded"  : {"tags": [{"name": TAG_ANUNCIO}]},
+                    "pipeline_id": pipeline,
+                    "status_id"  : stage,
+                    "_embedded"  : {"tags": [{"name": tag_canal}]},
                 }],
                 headers=headers,
             )
@@ -789,18 +835,20 @@ async def _identificar_lead_anuncio(
                 log.warning(f"⚠️ Patch lead {lead_id}: {patch_r.status_code} {patch_r.text[:150]}")
 
             # ── Nota de rastreamento completa ─────────────────────────────────
+            canal_nome = "Instagram DM" if is_ig else "WhatsApp"
             if retornou:
                 origem_txt = (
-                    f"♻️ *Lead Retornou via Contato Salvo*\n\n"
+                    f"♻️ *Lead Retornou via Contato Salvo ({canal_nome})*\n\n"
                     f"📌 Esta pessoa clicou no anúncio, salvou o contato\n"
                     f"   e voltou a mensagem {dias:.1f} dia(s) depois.\n"
                 )
             else:
-                origem_txt = f"📱 *Lead de Anúncio WhatsApp (clique direto)*\n\n"
+                icone = "📸" if is_ig else "📱"
+                origem_txt = f"{icone} *Lead de Anúncio {canal_nome} (clique direto)*\n\n"
 
             nota = (
                 f"{origem_txt}"
-                f"🎯 Origem: Campanha paga Meta — Click-to-WhatsApp\n"
+                f"🎯 Origem: Campanha paga Meta — {canal_nome}\n"
                 + (f"📢 Anúncio: {ad_headline}\n" if ad_headline else "")
                 + (f"🔑 Ad ID (source_id): {source_id}\n" if source_id else "")
                 + (f"🆔 ctwa_clid: {ctwa_clid}\n" if ctwa_clid else "")
