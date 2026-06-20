@@ -58,6 +58,8 @@ META_CAPI_URL    = f"https://graph.facebook.com/v20.0/{META_PIXEL_ID}/events"
 META_PAGE_ID     = os.environ.get("META_PAGE_ID",     "100627972913181")
 # Talks já processados nesta sessão (para detectar novas conversas)
 _talks_novos: set[str] = set()
+# Talks que vieram de anúncio CTWA — Sofia não responde, João atende manualmente
+_talks_anuncio: set[str] = set()
 
 # IDs do agente
 with open("ldm_ids.json") as f:
@@ -437,8 +439,9 @@ async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str 
         tem_quiz   = await _lead_tem_tag_quiz(lead_id or "")
 
         if is_anuncio:
-            # ── Veio de anúncio pago → identifica no Kommo + Sofia responde ──
-            log.info(f"[talk:{talk_id}] 📱 Lead de anúncio CTWA detectado")
+            # ── Veio de anúncio pago → identifica no Kommo, João atende ──────
+            log.info(f"[talk:{talk_id}] 📱 Lead de anúncio CTWA — João atenderá manualmente")
+            _talks_anuncio.add(talk_id)
             if lead_id:
                 asyncio.create_task(_identificar_lead_anuncio(lead_id, ctwa_clid))
         elif not tem_quiz:
@@ -461,6 +464,11 @@ async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str 
     if texto in ("__MIDIA__", "__ARQUIVO__"):
         await _enviar_resposta(talk_id, lead_id,
             "Olá! Recebi seu arquivo. Me descreva em *texto* como posso ajudar! 😊")
+        return
+
+    # ── Lead de anúncio → João atende manualmente, Sofia fica quieta ─────────
+    if talk_id in _talks_anuncio:
+        log.info(f"[talk:{talk_id}] 📱 Anúncio CTWA — aguardando atendimento manual do João")
         return
 
     log.info(f"[talk:{talk_id}] Recebido: {texto[:100]}")
