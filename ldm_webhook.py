@@ -647,6 +647,21 @@ async def receber_evento(request: Request):
         log.warning(f"Erro ao parsear payload: {e}")
         return JSONResponse({"status": "parse_error"}, status_code=400)
 
+    # 🔍 DEBUG TEMPORÁRIO — loga payload completo para detectar campo ctwa_clid
+    try:
+        import json as _json
+        payload_str = _json.dumps(dados, ensure_ascii=False, default=str)
+        if "ctwa" in payload_str.lower() or "referral" in payload_str.lower() or "source_id" in payload_str.lower():
+            log.info(f"🔍 DEBUG CTWA DETECTADO: {payload_str[:2000]}")
+        else:
+            # Loga apenas msgs add para inspecionar campos disponíveis
+            msgs_add = dados.get("message", {}).get("add", {})
+            if msgs_add:
+                first_msg = list(msgs_add.values())[0] if isinstance(msgs_add, dict) else msgs_add[0] if msgs_add else {}
+                log.info(f"🔍 DEBUG MSG FIELDS: {list(first_msg.keys())} | ctwa={first_msg.get('ctwa_clid','')} | ref={first_msg.get('referral',{})}")
+    except Exception:
+        pass
+
     mensagens = _extrair_mensagens(dados)
     for msg in mensagens:
         if msg["talk_id"]:
