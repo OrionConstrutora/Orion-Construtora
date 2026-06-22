@@ -406,6 +406,42 @@ async def _telefone_do_talk(talk_id: str) -> str:
 # ---------------------------------------------------------------------------
 # Envio inteligente
 # ---------------------------------------------------------------------------
+async def _buscar_ctwa_do_talk(talk_id: str) -> tuple[str, str]:
+    """
+    Busca ctwa_clid e source_id via API do Kommo no objeto talk.
+    Retorna (ctwa_clid, source_id) ou ("", "") se não encontrar.
+    """
+    if not talk_id:
+        return "", ""
+    headers = {"Authorization": f"Bearer {KOMMO_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as http:
+            r = await http.get(f"{KOMMO_API}/talks/{talk_id}", headers=headers)
+            if r.status_code != 200:
+                return "", ""
+            data = r.json()
+            log.info(f"🔍 Talk {talk_id} data keys: {list(data.keys())}")
+            # Busca ctwa_clid em vários campos possíveis
+            ctwa = (
+                str(data.get("ctwa_clid", ""))
+                or str(data.get("referral", {}).get("ctwa_clid", ""))
+                or str(data.get("origin", {}).get("ctwa_clid", ""))
+                or str(data.get("source", {}).get("ctwa_clid", ""))
+                or ""
+            )
+            source_id = (
+                str(data.get("referral", {}).get("source_id", ""))
+                or str(data.get("source_id", ""))
+                or ""
+            )
+            if ctwa or source_id:
+                log.info(f"✅ ctwa_clid via API talk: {ctwa[:20]} | source_id: {source_id}")
+            return ctwa, source_id
+    except Exception as e:
+        log.debug(f"[talk:{talk_id}] Erro ao buscar talk data: {e}")
+        return "", ""
+
+
 async def _enviar_resposta(talk_id: str, lead_id: str | None, texto: str):
     if WHATSAPP_TOKEN and WHATSAPP_PHONE_ID:
         telefone = await _telefone_do_talk(talk_id)
@@ -443,6 +479,16 @@ async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str 
         is_ig_ad   = is_instagram and source_type == "ad"   # Instagram DM de anúncio
         is_anuncio = is_ctwa or is_ig_ad
         tem_quiz   = await _lead_tem_tag_quiz(lead_id or "")
+
+        # Se ctwa_clid não veio no webhook, busca via API do Kommo
+        if not is_anuncio and not tem_quiz:
+            ctwa_api, source_api = await _buscar_ctwa_do_talk(talk_id)
+            if ctwa_api:
+                ctwa_clid = ctwa_api
+                source_id = source_api or source_id
+                is_ctwa   = True
+                is_anuncio = True
+                log.info(f"[talk:{talk_id}] 📱 ctwa_clid recuperado via API Kommo")
 
         # Busca o telefone/ID do contato para rastreamento
         telefone_lead = await _telefone_do_talk(talk_id)
