@@ -68,7 +68,8 @@ _telefones_anuncio: dict[str, dict] = {}
 with open("ldm_ids.json") as f:
     _ids = json.load(f)
 
-SOFIA_ID = _ids["sofia_id"]
+SOFIA_ID        = _ids["sofia_id"]
+ENVIRONMENT_ID  = _ids["environment_id"]
 
 # Sessões por talk_id
 _sessoes: dict[str, str] = {}
@@ -98,6 +99,7 @@ def _e_duplicada(talk_id: str, msg_id: str, texto: str) -> bool:
 def _criar_sessao(talk_id: str) -> str:
     sessao = client.beta.sessions.create(
         agent=SOFIA_ID,
+        environment_id=ENVIRONMENT_ID,
         title=f"LDM Talk {talk_id}",
     )
     log.info(f"Nova sessão para talk {talk_id}: {sessao.id}")
