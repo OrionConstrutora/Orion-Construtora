@@ -563,6 +563,11 @@ async def _processar(talk_id: str, lead_id: str | None, texto: str, msg_id: str 
         log.info(f"[talk:{talk_id}] 📱 Anúncio CTWA — aguardando atendimento manual do João")
         return
 
+    # ── Sofia desativada manualmente ──────────────────────────────────────────
+    if os.environ.get("SOFIA_DISABLED", "").lower() in ("1", "true", "yes"):
+        log.info(f"[talk:{talk_id}] Sofia desativada (SOFIA_DISABLED) — mensagem ignorada")
+        return
+
     log.info(f"[talk:{talk_id}] Recebido: {texto[:100]}")
     sessao_id = _obter_sessao(talk_id)
 
