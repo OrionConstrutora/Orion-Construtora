@@ -732,7 +732,12 @@ async def receber_evento(request: Request):
                 )
             )
 
-    return JSONResponse({"status": "ok", "processadas": len(mensagens)})
+    # Mudanças de etapa → CAPI (qualificado/reunião agendada)
+    status_leads = _extrair_status_leads(dados)
+    for st in status_leads:
+        asyncio.create_task(_capi_etapa_lead(st["lead_id"], st["status_id"]))
+
+    return JSONResponse({"status": "ok", "processadas": len(mensagens), "etapas": len(status_leads)})
 
 
 @app.get("/webhook")
@@ -779,6 +784,108 @@ STAGE_IG_QUALIFICANDO = 107914891  # Em Qualificacao
 STAGE_IG_QUALIFICADO  = 107914895  # Qualificado
 STAGE_IG_REUNIAO      = 107914899  # Reuniao Agendada
 STAGE_IG_NAO_QUAL     = 107914903  # Nao Qualificado
+
+
+# ---------------------------------------------------------------------------
+# CAPI — qualificação feita no Kommo (webhook status_lead)
+# Devolve ao Meta o sinal de qualificação humana/Sofia para otimização:
+#   etapa Qualificado (quiz/WA/IG)  → CompleteRegistration
+#   etapa Reunião Agendada (WA/IG)  → Schedule (sinal mais forte)
+# Leads do quiz já enviam CompleteRegistration pela própria página — são pulados.
+# ---------------------------------------------------------------------------
+STAGES_CAPI_QUALIFICADO = {STAGE_QUALIFICADO, STAGE_WA_QUALIFICADO, STAGE_IG_QUALIFICADO}
+STAGES_CAPI_REUNIAO     = {STAGE_WA_REUNIAO, STAGE_IG_REUNIAO}
+VALOR_QUALIFICADO       = 50000  # entrada mínima do projeto (mesmo valor usado no quiz)
+
+# Dedup local: evita reenvio se o Kommo repetir o webhook (TTL 48h)
+_capi_etapas_enviadas: dict[str, float] = {}
+
+
+def _extrair_status_leads(dados: dict) -> list[dict]:
+    """Extrai mudanças de etapa do payload Kommo (leads[status][N][...])."""
+    out = []
+    status = (dados.get("leads") or {}).get("status") or {}
+    itens = status.values() if isinstance(status, dict) else status
+    for it in itens or []:
+        if isinstance(it, dict) and it.get("id"):
+            try:
+                out.append({
+                    "lead_id"  : str(it["id"]),
+                    "status_id": int(it.get("status_id", 0)),
+                })
+            except (ValueError, TypeError):
+                pass
+    return out
+
+
+async def _capi_etapa_lead(lead_id: str, status_id: int):
+    """Envia CAPI quando lead muda para etapa de qualificação/reunião no Kommo."""
+    if status_id in STAGES_CAPI_REUNIAO:
+        event_name, event_id = "Schedule", f"kr-{lead_id}"
+    elif status_id in STAGES_CAPI_QUALIFICADO:
+        event_name, event_id = "CompleteRegistration", f"kq-{lead_id}"
+    else:
+        return
+
+    # Dedup local (Kommo pode reenviar o mesmo webhook)
+    agora = time.time()
+    chave = f"{lead_id}:{event_name}"
+    if agora - _capi_etapas_enviadas.get(chave, 0) < 172800:
+        return
+    _capi_etapas_enviadas[chave] = agora
+    for k in [k for k, t in _capi_etapas_enviadas.items() if agora - t > 172800]:
+        del _capi_etapas_enviadas[k]
+
+    # Lead do quiz já disparou CompleteRegistration na página — não duplica
+    if event_name == "CompleteRegistration" and status_id == STAGE_QUALIFICADO \
+            and await _lead_tem_tag_quiz(lead_id):
+        log.info(f"[capi-etapa] lead {lead_id} veio do quiz — CR já enviado pela página, pulando")
+        return
+
+    # Busca nome/telefone/email do contato no Kommo
+    nome = telefone = email = ""
+    headers = {"Authorization": f"Bearer {KOMMO_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.get(f"{KOMMO_API}/leads/{lead_id}",
+                               params={"with": "contacts"}, headers=headers)
+            if r.status_code != 200:
+                log.warning(f"[capi-etapa] lead {lead_id}: erro {r.status_code} ao buscar")
+                return
+            contatos = r.json().get("_embedded", {}).get("contacts", [])
+            if contatos:
+                rc = await http.get(f"{KOMMO_API}/contacts/{contatos[0]['id']}", headers=headers)
+                if rc.status_code == 200:
+                    c = rc.json()
+                    nome = c.get("name", "")
+                    for cf in (c.get("custom_fields_values") or []):
+                        if cf.get("field_code") == "PHONE" and cf.get("values"):
+                            telefone = cf["values"][0].get("value", "")
+                        elif cf.get("field_code") == "EMAIL" and cf.get("values"):
+                            email = cf["values"][0].get("value", "")
+    except Exception as e:
+        log.warning(f"[capi-etapa] lead {lead_id}: erro ao buscar contato: {e}")
+        return
+
+    if not telefone:
+        log.info(f"[capi-etapa] lead {lead_id} sem telefone — CAPI não enviado")
+        return
+
+    ok = await _enviar_capi(
+        event_name  = event_name,
+        event_id    = event_id,
+        telefone    = telefone,
+        nome        = nome,
+        email       = email,
+        custom_data = {
+            "content_category": "Imóveis Alto Padrão",
+            "content_name"    : f"Qualificação CRM Kommo — etapa {status_id}",
+            "currency"        : "BRL",
+            "value"           : VALOR_QUALIFICADO,
+        },
+    )
+    if ok:
+        log.info(f"📡 [capi-etapa] {event_name} → Meta | lead {lead_id} (etapa {status_id})")
 
 
 def _tel_limpo(telefone: str) -> str:
